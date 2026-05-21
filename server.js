@@ -2,6 +2,8 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -21,6 +23,83 @@ const LOSS_POINTS = -2 * MULTIPLIER;
 // ─── State ───────────────────────────────────────────────────────────────────
 const rooms = {};      // roomCode -> Room
 const players = {};    // socketId -> { name, roomCode }
+
+// ─── Leaderboard ─────────────────────────────────────────────────────────────
+// File-based persistence so wins survive restarts (Render's free disk is
+// ephemeral but persists for the lifetime of the running instance, which is
+// good enough for now; swap for a real DB later if needed).
+const LEADERBOARD_FILE = path.join(__dirname, 'leaderboard.json');
+let leaderboard = {
+  allTime: {},           // playerName -> wins
+  weekly: {},            // playerName -> wins (reset every Monday UTC)
+  weeklyStartedAt: null, // ISO date of the Monday that started this week
+};
+
+function getMondayMidnightUtc(date) {
+  const d = new Date(date);
+  d.setUTCHours(0, 0, 0, 0);
+  const day = d.getUTCDay();          // 0 Sun ... 6 Sat
+  const offset = (day + 6) % 7;       // days since Monday (Mon=0, Sun=6)
+  d.setUTCDate(d.getUTCDate() - offset);
+  return d;
+}
+
+function loadLeaderboard() {
+  try {
+    const raw = fs.readFileSync(LEADERBOARD_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    leaderboard = {
+      allTime: parsed.allTime || {},
+      weekly: parsed.weekly || {},
+      weeklyStartedAt: parsed.weeklyStartedAt || null,
+    };
+  } catch {
+    // first run — keep defaults
+  }
+  ensureWeeklyFresh();
+}
+
+function saveLeaderboard() {
+  try {
+    fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(leaderboard, null, 2));
+  } catch (e) {
+    console.error('Failed to save leaderboard:', e);
+  }
+}
+
+function ensureWeeklyFresh() {
+  const currentMonday = getMondayMidnightUtc(new Date()).toISOString();
+  if (leaderboard.weeklyStartedAt !== currentMonday) {
+    leaderboard.weekly = {};
+    leaderboard.weeklyStartedAt = currentMonday;
+    saveLeaderboard();
+  }
+}
+
+function recordWin(playerName) {
+  ensureWeeklyFresh();
+  const name = (playerName || '').trim();
+  if (!name) return;
+  leaderboard.allTime[name] = (leaderboard.allTime[name] || 0) + 1;
+  leaderboard.weekly[name] = (leaderboard.weekly[name] || 0) + 1;
+  saveLeaderboard();
+}
+
+function getLeaderboard() {
+  ensureWeeklyFresh();
+  const toSorted = (map) =>
+    Object.entries(map)
+      .map(([name, wins]) => ({ name, wins }))
+      .sort((a, b) => b.wins - a.wins || a.name.localeCompare(b.name))
+      .slice(0, 50);
+  return {
+    weekly: toSorted(leaderboard.weekly),
+    allTime: toSorted(leaderboard.allTime),
+    weeklyStartedAt: leaderboard.weeklyStartedAt,
+  };
+}
+
+loadLeaderboard();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 function generateRoomCode() {
@@ -142,9 +221,12 @@ io.on('connection', (socket) => {
     players[socket.id] = { name: playerName, roomCode: code };
     socket.join(code);
 
-    room.state = 'choosing_number';
-    io.to(code).emit('both_players_joined', getRoomInfo(room));
-    console.log(`👥 ${playerName} joined room: ${code}`);
+    // Multiplayer fairness: server always picks the secret so neither
+    // player can know it in advance.
+    room.secretNumber = generateSecretNumber();
+    room.secretSetBy = 'system';
+    startGame(room);
+    console.log(`👥 ${playerName} joined room: ${code} — system secret, starting`);
   });
 
   // ── 3. SINGLE PLAYER ──────────────────────────────────────────────────────
@@ -162,36 +244,7 @@ io.on('connection', (socket) => {
     console.log(`🎮 Single-player room: ${code}`);
   });
 
-  // ── 4. SET SECRET (2-player flow) ─────────────────────────────────────────
-  socket.on('set_secret_number', ({ secretNumber }) => {
-    const pInfo = players[socket.id];
-    if (!pInfo) return;
-    const room = rooms[pInfo.roomCode];
-    if (!room || room.state !== 'choosing_number') return;
-    if (room.secretNumber) return socket.emit('error', { message: 'Number already set.' });
-
-    if (!/^\d{5}$/.test(secretNumber) || new Set(secretNumber).size !== 5) {
-      return socket.emit('error', { message: 'Invalid number. Enter 5 unique digits.' });
-    }
-
-    room.secretNumber = secretNumber;
-    room.secretSetBy = socket.id;
-    startGame(room);
-  });
-
-  socket.on('set_secret_by_system', () => {
-    const pInfo = players[socket.id];
-    if (!pInfo) return;
-    const room = rooms[pInfo.roomCode];
-    if (!room || room.state !== 'choosing_number') return;
-    if (room.secretNumber) return;
-
-    room.secretNumber = generateSecretNumber();
-    room.secretSetBy = 'system';
-    startGame(room);
-  });
-
-  // ── 5. MAKE GUESS ─────────────────────────────────────────────────────────
+  // ── 4. MAKE GUESS ─────────────────────────────────────────────────────────
   socket.on('make_guess', ({ guess }) => {
     const pInfo = players[socket.id];
     if (!pInfo) return;
@@ -253,6 +306,11 @@ io.on('connection', (socket) => {
     if (!room.singlePlayer) switchTurn(room);
   });
 
+  // ── 5. LEADERBOARD ────────────────────────────────────────────────────────
+  socket.on('request_leaderboard', () => {
+    socket.emit('leaderboard_data', getLeaderboard());
+  });
+
   // ── 6. DISCONNECT ─────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     console.log(`❌ Disconnected: ${socket.id}`);
@@ -293,6 +351,10 @@ function switchTurn(room) {
 
 function finishGame(room, winner, pointsEarned, lastHint) {
   room.state = 'finished';
+  if (winner && winner.name) {
+    recordWin(winner.name);
+    io.emit('leaderboard_data', getLeaderboard());
+  }
   io.to(room.code).emit('game_over', {
     winner,
     secretNumber: room.secretNumber,
@@ -304,6 +366,7 @@ function finishGame(room, winner, pointsEarned, lastHint) {
 
 // ─── Health endpoint ─────────────────────────────────────────────────────────
 app.get('/', (_, res) => res.json({ status: 'Number Challenge Backend running 🎮' }));
+app.get('/leaderboard', (_, res) => res.json(getLeaderboard()));
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`🚀 Server started: http://localhost:${PORT}`));
