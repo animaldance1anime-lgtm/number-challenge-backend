@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const admin = require('firebase-admin');
 
 const app = express();
 app.use(cors());
@@ -14,6 +15,32 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
+// ─── Firebase Admin (auth) ───────────────────────────────────────────────────
+// In production (Render) set FIREBASE_SERVICE_ACCOUNT to the full JSON of the
+// service account key. Locally drop serviceAccountKey.json next to this file.
+function loadServiceAccount() {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    try {
+      return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    } catch (e) {
+      console.error('FIREBASE_SERVICE_ACCOUNT env is not valid JSON:', e.message);
+    }
+  }
+  const localPath = path.join(__dirname, 'serviceAccountKey.json');
+  if (fs.existsSync(localPath)) {
+    return require(localPath);
+  }
+  return null;
+}
+
+const serviceAccount = loadServiceAccount();
+if (serviceAccount) {
+  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+  console.log('🔐 Firebase Admin initialized');
+} else {
+  console.warn('⚠️  No Firebase credentials — token verification will reject all connections');
+}
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 const MULTIPLIER = 2;     // NORMAL RISK x2
 const MAX_ATTEMPTS = 3;
@@ -22,16 +49,16 @@ const LOSS_POINTS = -2 * MULTIPLIER;
 
 // ─── State ───────────────────────────────────────────────────────────────────
 const rooms = {};      // roomCode -> Room
-const players = {};    // socketId -> { name, roomCode }
+const players = {};    // socketId -> { uid, name, roomCode }
 
 // ─── Leaderboard ─────────────────────────────────────────────────────────────
-// File-based persistence so wins survive restarts (Render's free disk is
-// ephemeral but persists for the lifetime of the running instance, which is
-// good enough for now; swap for a real DB later if needed).
+// Keyed by Google uid so a returning player keeps their stats across sessions.
+// Stored entries: { name, photoUrl, wins }. File persists for the lifetime of
+// the Render instance — swap for a DB later if needed.
 const LEADERBOARD_FILE = path.join(__dirname, 'leaderboard.json');
 let leaderboard = {
-  allTime: {},           // playerName -> wins
-  weekly: {},            // playerName -> wins (reset every Monday UTC)
+  allTime: {},           // uid -> { name, photoUrl, wins }
+  weekly: {},            // uid -> { name, photoUrl, wins } (reset every Monday UTC)
   weeklyStartedAt: null, // ISO date of the Monday that started this week
 };
 
@@ -44,15 +71,24 @@ function getMondayMidnightUtc(date) {
   return d;
 }
 
+function isLegacyFormat(map) {
+  // Legacy: name-keyed with numeric values. New: uid-keyed with object values.
+  const sample = Object.values(map || {})[0];
+  return typeof sample === 'number';
+}
+
 function loadLeaderboard() {
   try {
     const raw = fs.readFileSync(LEADERBOARD_FILE, 'utf8');
     const parsed = JSON.parse(raw);
-    leaderboard = {
-      allTime: parsed.allTime || {},
-      weekly: parsed.weekly || {},
-      weeklyStartedAt: parsed.weeklyStartedAt || null,
-    };
+    leaderboard.allTime = parsed.allTime || {};
+    leaderboard.weekly = parsed.weekly || {};
+    leaderboard.weeklyStartedAt = parsed.weeklyStartedAt || null;
+    if (isLegacyFormat(leaderboard.allTime) || isLegacyFormat(leaderboard.weekly)) {
+      console.log('🔄 Detected legacy name-keyed leaderboard — resetting to uid-keyed format');
+      leaderboard.allTime = {};
+      leaderboard.weekly = {};
+    }
   } catch {
     // first run — keep defaults
   }
@@ -76,12 +112,20 @@ function ensureWeeklyFresh() {
   }
 }
 
-function recordWin(playerName) {
+function recordWin({ uid, name, photoUrl }) {
+  if (!uid) return;
   ensureWeeklyFresh();
-  const name = (playerName || '').trim();
-  if (!name) return;
-  leaderboard.allTime[name] = (leaderboard.allTime[name] || 0) + 1;
-  leaderboard.weekly[name] = (leaderboard.weekly[name] || 0) + 1;
+  const safeName = (name || '').trim() || 'Player';
+  const bump = (bucket) => {
+    const prev = bucket[uid] || { wins: 0 };
+    bucket[uid] = {
+      name: safeName,
+      photoUrl: photoUrl || null,
+      wins: (prev.wins || 0) + 1,
+    };
+  };
+  bump(leaderboard.allTime);
+  bump(leaderboard.weekly);
   saveLeaderboard();
 }
 
@@ -89,7 +133,12 @@ function getLeaderboard() {
   ensureWeeklyFresh();
   const toSorted = (map) =>
     Object.entries(map)
-      .map(([name, wins]) => ({ name, wins }))
+      .map(([uid, info]) => ({
+        uid,
+        name: info.name || 'Player',
+        photoUrl: info.photoUrl || null,
+        wins: info.wins || 0,
+      }))
       .sort((a, b) => b.wins - a.wins || a.name.localeCompare(b.name))
       .slice(0, 50);
   return {
@@ -157,9 +206,9 @@ function newRoom({ code, singlePlayer }) {
   return {
     code,
     maxAttempts: MAX_ATTEMPTS,
-    state: 'waiting',         // waiting | choosing_number | playing | finished
+    state: 'waiting',         // waiting | playing | finished
     secretNumber: null,
-    secretSetBy: null,        // 'system' | socketId
+    secretSetBy: null,        // 'system'
     currentTurn: null,
     turnIndex: 0,
     hintRows: [],
@@ -169,8 +218,8 @@ function newRoom({ code, singlePlayer }) {
   };
 }
 
-function newPlayer({ id, name }) {
-  return { id, name, score: 0, attempts: 0, guesses: [] };
+function newPlayer({ id, uid, name, photoUrl }) {
+  return { id, uid, name, photoUrl: photoUrl || null, score: 0, attempts: 0, guesses: [] };
 }
 
 function getRoomInfo(room) {
@@ -181,7 +230,9 @@ function getRoomInfo(room) {
     singlePlayer: room.singlePlayer,
     players: room.players.map(p => ({
       id: p.id,
+      uid: p.uid,
       name: p.name,
+      photoUrl: p.photoUrl,
       score: p.score,
       attempts: p.attempts,
       maxAttempts: room.maxAttempts,
@@ -191,57 +242,98 @@ function getRoomInfo(room) {
   };
 }
 
+// ─── Socket auth middleware ──────────────────────────────────────────────────
+io.use(async (socket, next) => {
+  if (!serviceAccount) {
+    return next(new Error('Server not configured for auth'));
+  }
+  const idToken = socket.handshake.auth && socket.handshake.auth.idToken;
+  if (!idToken) {
+    return next(new Error('Missing idToken'));
+  }
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    socket.uid = decoded.uid;
+    socket.displayName =
+      (decoded.name && decoded.name.trim()) ||
+      (decoded.email ? decoded.email.split('@')[0] : null) ||
+      'Player';
+    socket.photoUrl = decoded.picture || null;
+    next();
+  } catch (e) {
+    console.error('Auth failed:', e.code || e.message);
+    next(new Error('Authentication failed'));
+  }
+});
+
 // ─── Socket.io ───────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
-  console.log(`🔌 Connected: ${socket.id}`);
+  console.log(`🔌 Connected: ${socket.id} (uid=${socket.uid}, name=${socket.displayName})`);
 
   // ── 1. CREATE ROOM (2-player) ─────────────────────────────────────────────
-  socket.on('create_room', ({ playerName }) => {
+  socket.on('create_room', () => {
     const code = generateRoomCode();
     rooms[code] = newRoom({ code, singlePlayer: false });
-    rooms[code].players.push(newPlayer({ id: socket.id, name: playerName }));
-    players[socket.id] = { name: playerName, roomCode: code };
+    rooms[code].players.push(newPlayer({
+      id: socket.id,
+      uid: socket.uid,
+      name: socket.displayName,
+      photoUrl: socket.photoUrl,
+    }));
+    players[socket.id] = { uid: socket.uid, name: socket.displayName, roomCode: code };
 
     socket.join(code);
     socket.emit('room_created', { code });
-    console.log(`🏠 Room created: ${code}`);
+    console.log(`🏠 Room created: ${code} by ${socket.displayName}`);
   });
 
   // ── 2. JOIN ROOM ──────────────────────────────────────────────────────────
-  socket.on('join_room', ({ playerName, roomCode }) => {
-    const code = roomCode.toUpperCase();
+  socket.on('join_room', ({ roomCode }) => {
+    const code = (roomCode || '').toUpperCase();
     const room = rooms[code];
 
     if (!room) return socket.emit('error', { message: 'Room not found.' });
     if (room.singlePlayer) return socket.emit('error', { message: 'Room not found.' });
     if (room.state !== 'waiting') return socket.emit('error', { message: 'Game already started.' });
     if (room.players.length >= 2) return socket.emit('error', { message: 'Room is full.' });
+    if (room.players.some(p => p.uid === socket.uid)) {
+      return socket.emit('error', { message: 'You are already in this room.' });
+    }
 
-    room.players.push(newPlayer({ id: socket.id, name: playerName }));
-    players[socket.id] = { name: playerName, roomCode: code };
+    room.players.push(newPlayer({
+      id: socket.id,
+      uid: socket.uid,
+      name: socket.displayName,
+      photoUrl: socket.photoUrl,
+    }));
+    players[socket.id] = { uid: socket.uid, name: socket.displayName, roomCode: code };
     socket.join(code);
 
-    // Multiplayer fairness: server always picks the secret so neither
-    // player can know it in advance.
+    // Multiplayer fairness: server always picks the secret.
     room.secretNumber = generateSecretNumber();
     room.secretSetBy = 'system';
     startGame(room);
-    console.log(`👥 ${playerName} joined room: ${code} — system secret, starting`);
+    console.log(`👥 ${socket.displayName} joined room: ${code} — system secret, starting`);
   });
 
   // ── 3. SINGLE PLAYER ──────────────────────────────────────────────────────
-  socket.on('single_player', ({ playerName }) => {
+  socket.on('single_player', () => {
     const code = generateRoomCode();
     const room = newRoom({ code, singlePlayer: true });
-    room.players.push(newPlayer({ id: socket.id, name: playerName }));
+    room.players.push(newPlayer({
+      id: socket.id,
+      uid: socket.uid,
+      name: socket.displayName,
+      photoUrl: socket.photoUrl,
+    }));
     room.secretNumber = generateSecretNumber();
     room.secretSetBy = 'system';
     rooms[code] = room;
-    players[socket.id] = { name: playerName, roomCode: code };
+    players[socket.id] = { uid: socket.uid, name: socket.displayName, roomCode: code };
     socket.join(code);
 
     startGame(room);
-    console.log(`🎮 Single-player room: ${code}`);
+    console.log(`🎮 Single-player room: ${code} for ${socket.displayName}`);
   });
 
   // ── 4. MAKE GUESS ─────────────────────────────────────────────────────────
@@ -277,7 +369,7 @@ io.on('connection', (socket) => {
     if (won) {
       const points = calcPoints(player.attempts - 1, true);
       player.score += points;
-      finishGame(room, { id: socket.id, name: player.name }, points, hintRow);
+      finishGame(room, player, points, hintRow);
       return;
     }
 
@@ -336,7 +428,7 @@ function startGame(room) {
   room.systemHints = generateSystemHints(room.secretNumber);
   io.to(room.code).emit('game_started', {
     room: getRoomInfo(room),
-    secretSetBy: room.secretSetBy === 'system' ? 'system' : 'player',
+    secretSetBy: 'system',
   });
 }
 
@@ -349,14 +441,24 @@ function switchTurn(room) {
   });
 }
 
-function finishGame(room, winner, pointsEarned, lastHint) {
+function finishGame(room, winnerPlayer, pointsEarned, lastHint) {
   room.state = 'finished';
-  if (winner && winner.name) {
-    recordWin(winner.name);
+  if (winnerPlayer && winnerPlayer.uid) {
+    recordWin({
+      uid: winnerPlayer.uid,
+      name: winnerPlayer.name,
+      photoUrl: winnerPlayer.photoUrl,
+    });
     io.emit('leaderboard_data', getLeaderboard());
   }
   io.to(room.code).emit('game_over', {
-    winner,
+    winner: winnerPlayer
+      ? {
+          id: winnerPlayer.id,
+          uid: winnerPlayer.uid,
+          name: winnerPlayer.name,
+        }
+      : null,
     secretNumber: room.secretNumber,
     pointsEarned,
     room: getRoomInfo(room),
