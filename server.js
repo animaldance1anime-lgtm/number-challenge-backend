@@ -244,18 +244,26 @@ function getRoomInfo(room) {
 
 // ─── Socket auth middleware ──────────────────────────────────────────────────
 io.use(async (socket, next) => {
+  const idToken = socket.handshake.auth && socket.handshake.auth.idToken;
+  const handshakeName = socket.handshake.auth && socket.handshake.auth.displayName;
+
+  // Guest mode: no idToken — allow connection, no leaderboard tracking (uid stays null)
+  if (!idToken) {
+    socket.uid = null;
+    socket.displayName = (handshakeName && handshakeName.trim()) || 'Guest';
+    socket.photoUrl = null;
+    return next();
+  }
+
   if (!serviceAccount) {
     return next(new Error('Server not configured for auth'));
-  }
-  const idToken = socket.handshake.auth && socket.handshake.auth.idToken;
-  if (!idToken) {
-    return next(new Error('Missing idToken'));
   }
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
     socket.uid = decoded.uid;
     socket.displayName =
       (decoded.name && decoded.name.trim()) ||
+      (handshakeName && handshakeName.trim()) ||
       (decoded.email ? decoded.email.split('@')[0] : null) ||
       'Player';
     socket.photoUrl = decoded.picture || null;
