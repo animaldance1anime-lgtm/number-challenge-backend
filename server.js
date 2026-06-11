@@ -247,8 +247,8 @@ io.use(async (socket, next) => {
   const idToken = socket.handshake.auth && socket.handshake.auth.idToken;
   const handshakeName = socket.handshake.auth && socket.handshake.auth.displayName;
 
-  // Guest mode: no idToken — allow connection, no leaderboard tracking (uid stays null)
-  if (!idToken) {
+  // Guest mode: no idToken or explicit 'guest' — allow connection, no leaderboard tracking
+  if (!idToken || idToken === 'guest') {
     socket.uid = null;
     socket.displayName = (handshakeName && handshakeName.trim()) || 'Guest';
     socket.photoUrl = null;
