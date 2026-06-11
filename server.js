@@ -112,8 +112,8 @@ function ensureWeeklyFresh() {
   }
 }
 
-function recordWin({ uid, name, photoUrl }) {
-  if (!uid) return;
+function recordWin({ uid, name, photoUrl, isGuest }) {
+  if (!uid || isGuest) return;
   ensureWeeklyFresh();
   const safeName = (name || '').trim() || 'Player';
   const bump = (bucket) => {
@@ -218,8 +218,8 @@ function newRoom({ code, singlePlayer }) {
   };
 }
 
-function newPlayer({ id, uid, name, photoUrl }) {
-  return { id, uid, name, photoUrl: photoUrl || null, score: 0, attempts: 0, guesses: [] };
+function newPlayer({ id, uid, name, photoUrl, isGuest }) {
+  return { id, uid, name, photoUrl: photoUrl || null, isGuest: !!isGuest, score: 0, attempts: 0, guesses: [] };
 }
 
 function getRoomInfo(room) {
@@ -247,9 +247,10 @@ io.use(async (socket, next) => {
   const idToken = socket.handshake.auth && socket.handshake.auth.idToken;
   const handshakeName = socket.handshake.auth && socket.handshake.auth.displayName;
 
-  // Guest mode: no idToken or explicit 'guest' — allow connection, no leaderboard tracking
+  // Guest mode: no token or explicit 'guest' string → use socket.id as uid, no leaderboard
   if (!idToken || idToken === 'guest') {
-    socket.uid = null;
+    socket.uid = socket.id;
+    socket.isGuest = true;
     socket.displayName = (handshakeName && handshakeName.trim()) || 'Guest';
     socket.photoUrl = null;
     return next();
@@ -261,6 +262,7 @@ io.use(async (socket, next) => {
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
     socket.uid = decoded.uid;
+    socket.isGuest = false;
     socket.displayName =
       (decoded.name && decoded.name.trim()) ||
       (handshakeName && handshakeName.trim()) ||
@@ -287,6 +289,7 @@ io.on('connection', (socket) => {
       uid: socket.uid,
       name: socket.displayName,
       photoUrl: socket.photoUrl,
+      isGuest: socket.isGuest,
     }));
     players[socket.id] = { uid: socket.uid, name: socket.displayName, roomCode: code };
 
@@ -313,6 +316,7 @@ io.on('connection', (socket) => {
       uid: socket.uid,
       name: socket.displayName,
       photoUrl: socket.photoUrl,
+      isGuest: socket.isGuest,
     }));
     players[socket.id] = { uid: socket.uid, name: socket.displayName, roomCode: code };
     socket.join(code);
@@ -333,6 +337,7 @@ io.on('connection', (socket) => {
       uid: socket.uid,
       name: socket.displayName,
       photoUrl: socket.photoUrl,
+      isGuest: socket.isGuest,
     }));
     room.secretNumber = generateSecretNumber();
     room.secretSetBy = 'system';
@@ -451,11 +456,12 @@ function switchTurn(room) {
 
 function finishGame(room, winnerPlayer, pointsEarned, lastHint) {
   room.state = 'finished';
-  if (winnerPlayer && winnerPlayer.uid) {
+  if (winnerPlayer && winnerPlayer.uid && !winnerPlayer.isGuest) {
     recordWin({
       uid: winnerPlayer.uid,
       name: winnerPlayer.name,
       photoUrl: winnerPlayer.photoUrl,
+      isGuest: false,
     });
     io.emit('leaderboard_data', getLeaderboard());
   }
