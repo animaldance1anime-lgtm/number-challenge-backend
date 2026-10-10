@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const admin = require('firebase-admin');
@@ -247,9 +248,9 @@ io.use(async (socket, next) => {
   const idToken = socket.handshake.auth && socket.handshake.auth.idToken;
   const handshakeName = socket.handshake.auth && socket.handshake.auth.displayName;
 
-  // Guest mode: no token or explicit 'guest' string → use socket.id as uid, no leaderboard
+  // Guest mode: no token or explicit 'guest' string → unique per-connection uid, no leaderboard
   if (!idToken || idToken === 'guest') {
-    socket.uid = socket.id;
+    socket.uid = `guest:${crypto.randomUUID()}`;
     socket.isGuest = true;
     socket.displayName = (handshakeName && handshakeName.trim()) || 'Guest';
     socket.photoUrl = null;
@@ -307,7 +308,11 @@ io.on('connection', (socket) => {
     if (room.singlePlayer) return socket.emit('error', { message: 'Room not found.' });
     if (room.state !== 'waiting') return socket.emit('error', { message: 'Game already started.' });
     if (room.players.length >= 2) return socket.emit('error', { message: 'Room is full.' });
-    if (room.players.some(p => p.uid === socket.uid)) {
+    // Guests have no account, so two guests are never "the same player" —
+    // only the same socket, or the same signed-in account, counts as a duplicate.
+    const alreadyInRoom = room.players.some(p =>
+      p.id === socket.id || (!socket.isGuest && !p.isGuest && p.uid === socket.uid));
+    if (alreadyInRoom) {
       return socket.emit('error', { message: 'You are already in this room.' });
     }
 
